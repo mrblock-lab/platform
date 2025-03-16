@@ -48,12 +48,14 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
     struct Balances {
         uint112 locked;
         uint112 boosted;
-        uint32 nextUnlockIndex;
     }
     struct LockedBalance {
         uint112 amount;
         uint112 boosted;
         uint32 unlockTime;
+        uint256 lockTier;
+        uint256 lockDuration;
+        bool isWithdrawn;
     }
     struct EarnedData {
         address token;
@@ -62,6 +64,11 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
     struct Epoch {
         uint224 supply; //epoch boosted supply
         uint32 date; //epoch start date
+    }
+    struct LockTier {
+        uint256 duration;
+        uint256 boostRate;
+        bool isActive;
     }
 
     //token constants
@@ -76,7 +83,7 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
     uint256 public constant rewardsDuration = 86400 * 7;
 
     // Duration of lock/earned penalty period
-    uint256 public constant lockDuration = rewardsDuration * 16;
+    // uint256 public constant lockDuration = rewardsDuration * 16;
 
     // reward token -> distributor -> is approved to add rewards
     mapping(address => mapping(address => bool)) public rewardDistributors;
@@ -121,6 +128,9 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
     string private _symbol;
     uint8 private immutable _decimals;
 
+    // lock tiers
+    LockTier[] public lockTiers;
+
     /* ========== CONSTRUCTOR ========== */
 
     constructor() public Ownable() {
@@ -132,6 +142,34 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
         epochs.push(Epoch({
             supply: 0,
             date: uint32(currentEpoch)
+        }));
+
+        // 0.25 year, 1x boost
+        lockTiers.push(LockTier({
+            duration: rewardsDuration * 13,
+            boostRate: 10000,
+            isActive: true
+        }));
+
+        // 0.5 year, 2x boost
+        lockTiers.push(LockTier({
+            duration: rewardsDuration * 26,
+            boostRate: 20000,
+            isActive: true
+        }));
+
+        // 1 year, 3x boost
+        lockTiers.push(LockTier({
+            duration: rewardsDuration * 52,
+            boostRate: 30000,
+            isActive: true
+        }));
+
+        // 2 year, 4x boost
+        lockTiers.push(LockTier({
+            duration: rewardsDuration * 104,
+            boostRate: 40000,
+            isActive: true
         }));
     }
 
@@ -228,6 +266,18 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
         IERC20(stakingToken).safeApprove(stakingProxy, uint256(-1));
     }
 
+    function addBoostTier(uint256 _duration, uint256 _boostRate) external onlyOwner {
+        lockTiers.push(LockTier({
+            duration: _duration,
+            boostRate: _boostRate,
+            isActive: true
+        }));
+    }
+
+    function setBoostTierActive(uint256 _tier, bool _isActive) external onlyOwner {
+        lockTiers[_tier].isActive = _isActive;
+    }
+
     /* ========== VIEWS ========== */
 
     function _rewardPerToken(address _rewardsToken) internal view returns(uint256) {
@@ -294,27 +344,17 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
     //BOOSTED balance of an account which only includes properly locked tokens as of the most recent eligible epoch
     function balanceOf(address _user) view external returns(uint256 amount) {
         LockedBalance[] storage locks = userLocks[_user];
-        Balances storage userBalance = balances[_user];
-        uint256 nextUnlockIndex = userBalance.nextUnlockIndex;
 
         //start with current boosted amount
         amount = balances[_user].boosted;
 
         uint256 locksLength = locks.length;
-        //remove old records only (will be better gas-wise than adding up)
-        for (uint i = nextUnlockIndex; i < locksLength; i++) {
-            if (locks[i].unlockTime <= block.timestamp) {
-                amount = amount.sub(locks[i].boosted);
-            } else {
-                //stop now as no futher checks are needed
-                break;
-            }
-        }
-
-        //also remove amount locked in the next epoch
         uint256 currentEpoch = block.timestamp.div(rewardsDuration).mul(rewardsDuration);
-        if (locksLength > 0 && uint256(locks[locksLength - 1].unlockTime).sub(lockDuration) > currentEpoch) {
-            amount = amount.sub(locks[locksLength - 1].boosted);
+        //remove old records only (will be better gas-wise than adding up)
+        for (uint i = 0; i < locksLength; i++) {
+            if ( (!locks[i].isWithdrawn && locks[i].unlockTime <= block.timestamp) || uint256(locks[i].unlockTime).sub(locks[i].lockDuration) > currentEpoch ) {
+                amount = amount.sub(locks[i].boosted);
+            }
         }
 
         return amount;
@@ -326,66 +366,30 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
 
         //get timestamp of given epoch index
         uint256 epochTime = epochs[_epoch].date;
-        //get timestamp of first non-inclusive epoch
-        uint256 cutoffEpoch = epochTime.sub(lockDuration);
 
         //need to add up since the range could be in the middle somewhere
         //traverse inversely to make more current queries more gas efficient
         for (uint i = locks.length - 1; i + 1 != 0; i--) {
-            uint256 lockEpoch = uint256(locks[i].unlockTime).sub(lockDuration);
+            uint256 lockEpoch = uint256(locks[i].unlockTime).sub(locks[i].lockDuration);
             //lock epoch must be less or equal to the epoch we're basing from.
-            if (lockEpoch <= epochTime) {
-                if (lockEpoch > cutoffEpoch) {
-                    amount = amount.add(locks[i].boosted);
-                } else {
-                    //stop now as no futher checks matter
-                    break;
-                }
+            if (lockEpoch <= epochTime && !locks[i].isWithdrawn) {
+                amount = amount.add(locks[i].boosted);
             }
         }
 
         return amount;
     }
 
-    //return currently locked but not active balance
-    function pendingLockOf(address _user) view external returns(uint256 amount) {
-        LockedBalance[] storage locks = userLocks[_user];
-
-        uint256 locksLength = locks.length;
-
-        //return amount if latest lock is in the future
-        uint256 currentEpoch = block.timestamp.div(rewardsDuration).mul(rewardsDuration);
-        if (locksLength > 0 && uint256(locks[locksLength - 1].unlockTime).sub(lockDuration) > currentEpoch) {
-            return locks[locksLength - 1].boosted;
-        }
-
-        return 0;
-    }
-
-    function pendingLockAtEpochOf(uint256 _epoch, address _user) view external returns(uint256 amount) {
-        LockedBalance[] storage locks = userLocks[_user];
-
-        //get next epoch from the given epoch index
-        uint256 nextEpoch = uint256(epochs[_epoch].date).add(rewardsDuration);
-
-        //traverse inversely to make more current queries more gas efficient
-        for (uint i = locks.length - 1; i + 1 != 0; i--) {
-            uint256 lockEpoch = uint256(locks[i].unlockTime).sub(lockDuration);
-            
-            //return the next epoch balance
-            if (lockEpoch == nextEpoch) {
-                return locks[i].boosted;
-            }else if(lockEpoch < nextEpoch){
-                //no need to check anymore
-                break;
-            }
-        }
-
-        return 0;
-    }
-
     //supply of all properly locked BOOSTED balances at most recent eligible epoch
     function totalSupply() view external returns(uint256 supply) {
+
+        uint256 lockDuration = 0;
+        for (uint i = 0; i < lockTiers.length; i++) {
+            LockTier memory lockTier = lockTiers[i];
+            if (lockTier.duration > lockDuration) {
+                lockDuration = lockTier.duration;
+            }
+        }
 
         uint256 currentEpoch = block.timestamp.div(rewardsDuration).mul(rewardsDuration);
         uint256 cutoffEpoch = currentEpoch.sub(lockDuration);
@@ -410,6 +414,13 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
 
     //supply of all properly locked BOOSTED balances at the given epoch
     function totalSupplyAtEpoch(uint256 _epoch) view external returns(uint256 supply) {
+        uint256 lockDuration = 0;
+        for (uint i = 0; i < lockTiers.length; i++) {
+            LockTier memory lockTier = lockTiers[i];
+            if (lockTier.duration > lockDuration) {
+                lockDuration = lockTier.duration;
+            }
+        }
 
         uint256 epochStart = uint256(epochs[_epoch].date).div(rewardsDuration).mul(rewardsDuration);
         uint256 cutoffEpoch = epochStart.sub(lockDuration);
@@ -463,18 +474,19 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
     ) {
         LockedBalance[] storage locks = userLocks[_user];
         Balances storage userBalance = balances[_user];
-        uint256 nextUnlockIndex = userBalance.nextUnlockIndex;
         uint256 idx;
-        for (uint i = nextUnlockIndex; i < locks.length; i++) {
-            if (locks[i].unlockTime > block.timestamp) {
-                if (idx == 0) {
-                    lockData = new LockedBalance[](locks.length - i);
-                }
-                lockData[idx] = locks[i];
-                idx++;
-                locked = locked.add(locks[i].amount);
+        for (uint i = 0; i < locks.length; i++) {
+            if (locks[i].isWithdrawn) {
+                if (locks[i].unlockTime > block.timestamp) {
+                    if (idx == 0) {
+                        lockData = new LockedBalance[](locks.length - i);
+                    }
+                    lockData[idx] = locks[i];
+                    idx++;
+                    locked = locked.add(locks[i].amount);
             } else {
-                unlockable = unlockable.add(locks[i].amount);
+                    unlockable = unlockable.add(locks[i].amount);
+                }
             }
         }
         return (userBalance.locked, unlockable, locked, lockData);
@@ -521,22 +533,26 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
     }
 
     // Locked tokens cannot be withdrawn for lockDuration and are eligible to receive stakingReward rewards
-    function lock(address _account, uint256 _amount, uint256 _spendRatio) external nonReentrant updateReward(_account) {
-
+    function lock(address _account, uint256 _amount, uint256 _spendRatio, uint256 _lockTier) external nonReentrant updateReward(_account) {
         //pull tokens
         stakingToken.safeTransferFrom(msg.sender, address(this), _amount);
 
         //lock
-        _lock(_account, _amount, _spendRatio, false);
+        _lock(_account, _amount, _spendRatio, _lockTier);
     }
 
     //lock tokens
-    function _lock(address _account, uint256 _amount, uint256 _spendRatio, bool _isRelock) internal {
+    function _lock(address _account, uint256 _amount, uint256 _spendRatio, uint256 _lockTier) internal {
         require(_amount > 0, "Cannot stake 0");
         require(_spendRatio <= maximumBoostPayment, "over max spend");
         require(!isShutdown, "shutdown");
+        require(_lockTier < lockTiers.length, "invalid lock tier");
 
         Balances storage bal = balances[_account];
+
+        // get lock tier
+        LockTier memory lockTier = lockTiers[_lockTier];
+        require(lockTier.isActive, "lock tier not active");
 
         //must try check pointing epoch first
         _checkpointEpoch();
@@ -545,7 +561,8 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
         uint256 spendAmount = _amount.mul(_spendRatio).div(denominator);
         uint256 boostRatio = boostRate.mul(_spendRatio).div(maximumBoostPayment==0?1:maximumBoostPayment);
         uint112 lockAmount = _amount.sub(spendAmount).to112();
-        uint112 boostedAmount = _amount.add(_amount.mul(boostRatio).div(denominator)).to112();
+        uint256 boostAmount = _amount.add(_amount.mul(boostRatio).div(denominator));
+        uint112 boostedAmount = boostAmount.mul(lockTier.boostRate).div(denominator).to112();
 
         //add user balances
         bal.locked = bal.locked.add(lockAmount);
@@ -557,72 +574,19 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
 
         //add user lock records or add to current
         uint256 lockEpoch = block.timestamp.div(rewardsDuration).mul(rewardsDuration);
-        //if a fresh lock, add on an extra duration period
-        if(!_isRelock){
-            lockEpoch = lockEpoch.add(rewardsDuration);
-        }
-        uint256 unlockTime = lockEpoch.add(lockDuration);
-        uint256 idx = userLocks[_account].length;
+ 
+        uint256 unlockTime = lockEpoch.add(lockTier.duration);
 
-        //if the latest user lock is smaller than this lock, always just add new entry to the end of the list
-        if (idx == 0 || userLocks[_account][idx - 1].unlockTime < unlockTime) {
-            userLocks[_account].push(LockedBalance({
+        userLocks[_account].push(LockedBalance({
                 amount: lockAmount,
                 boosted: boostedAmount,
-                unlockTime: uint32(unlockTime)
+                unlockTime: uint32(unlockTime),
+                lockTier: _lockTier,
+                lockDuration: lockTier.duration,
+                isWithdrawn: false
             }));
-        } else {
-            //else add to a current lock
 
-            //if latest lock is further in the future, lower index
-            //this can only happen if relocking an expired lock after creating a new lock
-            if(userLocks[_account][idx - 1].unlockTime > unlockTime){
-                idx--;
-            }
-
-            //if idx points to the epoch when same unlock time, update
-            //(this is always true with a normal lock but maybe not with relock)
-            if(userLocks[_account][idx - 1].unlockTime == unlockTime){
-                LockedBalance storage userL = userLocks[_account][idx - 1];
-                userL.amount = userL.amount.add(lockAmount);
-                userL.boosted = userL.boosted.add(boostedAmount);
-            }else{
-                //can only enter here if a relock is made after a lock and there's no lock entry
-                //for the current epoch.
-                //ex a list of locks such as "[...][older][current*][next]" but without a "current" lock
-                //length - 1 is the next epoch
-                //length - 2 is a past epoch
-                //thus need to insert an entry for current epoch at the 2nd to last entry
-                //we will copy and insert the tail entry(next) and then overwrite length-2 entry
-
-                //reset idx
-                idx = userLocks[_account].length;
-
-                //get current last item
-                LockedBalance storage userL = userLocks[_account][idx - 1];
-
-                //add a copy to end of list
-                userLocks[_account].push(LockedBalance({
-                    amount: userL.amount,
-                    boosted: userL.boosted,
-                    unlockTime: userL.unlockTime
-                }));
-
-                //insert current epoch lock entry by overwriting the entry at length-2
-                userL.amount = lockAmount;
-                userL.boosted = boostedAmount;
-                userL.unlockTime = uint32(unlockTime);
-            }
-        }
-
-        
-        //update epoch supply, epoch checkpointed above so safe to add to latest
-        uint256 eIndex = epochs.length - 1;
-        //if relock, epoch should be current and not next, thus need to decrease index to length-2
-        if(_isRelock){
-            eIndex--;
-        }
-        Epoch storage e = epochs[eIndex];
+        Epoch storage e = epochs[epochs.length - 1];
         e.supply = e.supply.add(uint224(boostedAmount));
 
         //send boost payment
@@ -637,58 +601,36 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
     }
 
     // Withdraw all currently locked tokens where the unlock time has passed
-    function _processExpiredLocks(address _account, bool _relock, uint256 _spendRatio, address _withdrawTo, address _rewardAddress, uint256 _checkDelay) internal updateReward(_account) {
-        LockedBalance[] storage locks = userLocks[_account];
+    function _processExpiredLocks(address _account, bool _relock, uint256 _spendRatio, address _withdrawTo, uint256[] memory _index) internal updateReward(_account) {
         Balances storage userBalance = balances[_account];
+
         uint112 locked;
         uint112 boostedAmount;
-        uint256 length = locks.length;
-        uint256 reward = 0;
         
-        if (isShutdown || locks[length - 1].unlockTime <= block.timestamp.sub(_checkDelay)) {
+        if (isShutdown) {
             //if time is beyond last lock, can just bundle everything together
             locked = userBalance.locked;
             boostedAmount = userBalance.boosted;
-
-            //dont delete, just set next index
-            userBalance.nextUnlockIndex = length.to32();
-
-            //check for kick reward
-            //this wont have the exact reward rate that you would get if looped through
-            //but this section is supposed to be for quick and easy low gas processing of all locks
-            //we'll assume that if the reward was good enough someone would have processed at an earlier epoch
-            if (_checkDelay > 0) {
-                uint256 currentEpoch = block.timestamp.sub(_checkDelay).div(rewardsDuration).mul(rewardsDuration);
-                uint256 epochsover = currentEpoch.sub(uint256(locks[length - 1].unlockTime)).div(rewardsDuration);
-                uint256 rRate = MathUtil.min(kickRewardPerEpoch.mul(epochsover+1), denominator);
-                reward = uint256(locks[length - 1].amount).mul(rRate).div(denominator);
-            }
         } else {
+            for (uint i = 0; i < _index.length; i++) {
+                require(_index[i] < userLocks[_account].length, "Invalid index");
+                LockedBalance storage userLock = userLocks[_account][_index[i]];
+                require(!userLock.isWithdrawn, "Already withdrawn");
+                require(userLock.unlockTime <= block.timestamp, "Not expired");
 
-            //use a processed index(nextUnlockIndex) to not loop as much
-            //deleting does not change array length
-            uint32 nextUnlockIndex = userBalance.nextUnlockIndex;
-            for (uint i = nextUnlockIndex; i < length; i++) {
-                //unlock time must be less or equal to time
-                if (locks[i].unlockTime > block.timestamp.sub(_checkDelay)) break;
+                userLock.isWithdrawn = true;
 
                 //add to cumulative amounts
-                locked = locked.add(locks[i].amount);
-                boostedAmount = boostedAmount.add(locks[i].boosted);
+                locked = locked.add(userLock.amount);
+                boostedAmount = boostedAmount.add(userLock.boosted);
 
-                //check for kick reward
-                //each epoch over due increases reward
-                if (_checkDelay > 0) {
-                    uint256 currentEpoch = block.timestamp.sub(_checkDelay).div(rewardsDuration).mul(rewardsDuration);
-                    uint256 epochsover = currentEpoch.sub(uint256(locks[i].unlockTime)).div(rewardsDuration);
-                    uint256 rRate = MathUtil.min(kickRewardPerEpoch.mul(epochsover+1), denominator);
-                    reward = reward.add( uint256(locks[i].amount).mul(rRate).div(denominator));
+                //relock or return to user
+                if (_relock) {
+                    _lock(_withdrawTo, userLock.amount, _spendRatio, userLock.lockTier);
+                } else {
+                    transferCVX(_withdrawTo, userLock.amount, true);
                 }
-                //set next unlock index
-                nextUnlockIndex++;
             }
-            //update next unlock index
-            userBalance.nextUnlockIndex = nextUnlockIndex;
         }
         require(locked > 0, "no exp locks");
 
@@ -699,46 +641,29 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
         boostedSupply = boostedSupply.sub(boostedAmount);
 
         emit Withdrawn(_account, locked, _relock);
-
-        //send process incentive
-        if (reward > 0) {
-            //if theres a reward(kicked), it will always be a withdraw only
-            //preallocate enough cvx from stake contract to pay for both reward and withdraw
-            allocateCVXForTransfer(uint256(locked));
-
-            //reduce return amount by the kick reward
-            locked = locked.sub(reward.to112());
-            
-            //transfer reward
-            transferCVX(_rewardAddress, reward, false);
-
-            emit KickReward(_rewardAddress, _account, reward);
-        }else if(_spendRatio > 0){
-            //preallocate enough cvx to transfer the boost cost
-            allocateCVXForTransfer( uint256(locked).mul(_spendRatio).div(denominator) );
-        }
-
-        //relock or return to user
-        if (_relock) {
-            _lock(_withdrawTo, locked, _spendRatio, true);
-        } else {
-            transferCVX(_withdrawTo, locked, true);
-        }
     }
 
     // withdraw expired locks to a different address
-    function withdrawExpiredLocksTo(address _withdrawTo) external nonReentrant {
-        _processExpiredLocks(msg.sender, false, 0, _withdrawTo, msg.sender, 0);
+    function withdrawExpiredLocksTo(uint256[] memory _index, address _withdrawTo) external nonReentrant {
+        require(_index.length > 0, "No index");
+        require(_index.length <= userLocks[msg.sender].length, "Invalid index");
+        
+        _processExpiredLocks(msg.sender, false, 0, _withdrawTo, _index);
     }
 
     // Withdraw/relock all currently locked tokens where the unlock time has passed
-    function processExpiredLocks(bool _relock) external nonReentrant {
-        _processExpiredLocks(msg.sender, _relock, 0, msg.sender, msg.sender, 0);
+    function processExpiredLocks(uint256[] memory _index) external nonReentrant {
+        require(_index.length > 0, "No index");
+        require(_index.length <= userLocks[msg.sender].length, "Invalid index");
+        
+        _processExpiredLocks(msg.sender, true, 0, msg.sender, _index);
     }
 
-    function kickExpiredLocks(address _account) external nonReentrant {
-        //allow kick after grace period of 'kickRewardEpochDelay'
-        _processExpiredLocks(_account, false, 0, _account, msg.sender, rewardsDuration.mul(kickRewardEpochDelay));
+    function kickExpiredLocks(address _account, uint256[] memory _index) external nonReentrant onlyOwner {
+        require(_index.length > 0, "No index");
+        require(_index.length <= userLocks[_account].length, "Invalid index");
+        
+        _processExpiredLocks(_account, true, 0, _account, _index);
     }
 
     //pull required amount of cvx from staking for an upcoming transfer
@@ -767,9 +692,8 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
         if (isShutdown) return;
 
         //get balances
-        uint256 local = stakingToken.balanceOf(address(this));
         uint256 staked = IStakingProxy(stakingProxy).getBalance();
-        uint256 total = local.add(staked);
+        uint256 total = stakingToken.balanceOf(address(this)).add(staked);
         
         if(total == 0) return;
 
@@ -777,13 +701,13 @@ contract CvxLockerV2 is ReentrancyGuard, Ownable {
         uint256 ratio = staked.mul(denominator).div(total);
         //mean will be where we reset to if unbalanced
         uint256 mean = maximumStake.add(minimumStake).div(2);
-        uint256 max = maximumStake.add(_offset);
-        uint256 min = Math.min(minimumStake, minimumStake - _offset);
-        if (ratio > max) {
+        // uint256 max = maximumStake.add(_offset);
+        // uint256 min = Math.min(minimumStake, minimumStake - _offset);
+        if (ratio > maximumStake.add(_offset)) {
             //remove
             uint256 remove = staked.sub(total.mul(mean).div(denominator));
             IStakingProxy(stakingProxy).withdraw(remove);
-        } else if (ratio < min) {
+        } else if (ratio <  Math.min(minimumStake, minimumStake - _offset)) {
             //add
             uint256 increase = total.mul(mean).div(denominator).sub(staked);
             stakingToken.safeTransfer(stakingProxy, increase);
